@@ -356,7 +356,7 @@ def wrap_module(
     )
     try:
         try:
-            runpy.run_path(sys.argv[0], run_name=__name__)
+            runpy.run_path(sys.argv[0], run_name="__main__")
         except SyntaxError:
             subprocess.Popen(sys.argv).wait()  # noqa: S603
     except BaseException:
