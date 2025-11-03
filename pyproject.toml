@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "dissi"
 dynamic = ["version"]
-dependencies = ["doctyper", "dotenv", "requests"]
+dependencies = ["typer", "dotenv", "requests"]
 requires-python = ">=3.9"
 authors = [{ name = "Tim Hörmann", email = "pypi@audivir.de" }]
 description = "Discord Logger and Wrapper."
