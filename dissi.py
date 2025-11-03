@@ -6,6 +6,7 @@ import atexit
 import http
 import logging
 import os
+import re
 import shlex
 import shutil
 import socket
@@ -13,9 +14,10 @@ import subprocess
 import sys
 import time
 import traceback
+from datetime import datetime, timezone
 from enum import IntEnum
 from pathlib import Path
-from threading import Semaphore
+from threading import Lock, Semaphore, Timer
 from typing import TYPE_CHECKING, Annotated, Any
 
 import dotenv
@@ -24,7 +26,7 @@ import typer
 from typing_extensions import override
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Callable, Mapping, Sequence
     from logging import Logger, LogRecord, _FormatStyle, _Level
 
 __version__ = "0.1.1"
@@ -40,6 +42,14 @@ class Exit(Exception):  # noqa: N818
         super().__init__()
         self.code = code
         self.stderr = stderr
+
+
+def _typer_app(func: Callable[..., None], context: dict[str, Any] | None = None) -> None:
+    dotenv_path = dotenv.find_dotenv(usecwd=True)
+    dotenv.load_dotenv(dotenv_path)
+    app = typer.Typer(add_completion=False, pretty_exceptions_enable=False)
+    app.command(context_settings=context)(func)
+    app()
 
 
 def _cap_cmd(args: list[str] | None = None, max_chars: int = 100) -> str:
@@ -81,7 +91,7 @@ logging.Logger.flush = _flush  # type: ignore[attr-defined]
 DISCORD_TIMEOUT = 5
 MAX_DISCORD_MESSAGE_LEN = 2000
 DIFF_MESSAGE_TEMPLATE = """\
-### {hostname}
+### {hostname}{title}
 ```diff
 {text}
 ```
@@ -108,12 +118,18 @@ class DiscordWebhookConfig:
     """Config for the template and prefixes."""
 
     def __init__(
-        self, template: str | None = None, prefixes: Mapping[str, str] | None = None
+        self,
+        template: str | None = None,
+        prefixes: Mapping[str, str] | None = None,
+        title: str | None = None,
     ) -> None:
         """Initialize a Discord Webhook config."""
         self.template = template or DIFF_MESSAGE_TEMPLATE
         self.prefixes = prefixes or DIFF_LEVEL_PREFIXES
-        template_len = len(self.template.format(hostname=socket.gethostname(), text=""))
+        self.title = f": {title}" if title else ""
+        template_len = len(
+            self.template.format(hostname=socket.gethostname(), title=title, text="")
+        )
         self.max_len = MAX_DISCORD_MESSAGE_LEN - template_len
 
         prefix_lens = {len(v) for v in self.prefixes.values()}
@@ -204,9 +220,13 @@ class DiscordWebhookHandler(logging.Handler):
         self.formatter: DiscordWebhookFormatter = formatter or DiscordWebhookFormatter()  # type:ignore[mutable-override]
         self.config = self.formatter.config
         # Limit concurrent requests to avoid hitting rate limits.
-        self._lock = Semaphore(5)
+        self._sema = Semaphore(5)
+        self._lock = Lock()
 
         self.auto_flush = auto_flush
+        self.last_emit = time.monotonic()
+        self.timer_interval = 60 / 30  # 30 messages per minute
+        self._start_timer()
 
         # buffer for storing shorter logs and sending them in larger batches
         self.buffer: list[tuple[LogRecord, list[str]]] = []
@@ -214,6 +234,55 @@ class DiscordWebhookHandler(logging.Handler):
 
         # send all remaining buffered messages before app exit
         atexit.register(self.send)
+
+    def _start_timer(self) -> None:
+        self.timer = Timer(self.timer_interval, self._timer_tick)
+        self.timer.daemon = True
+        self.timer.start()
+
+    def _timer_tick(self) -> None:
+        with self._lock:
+            self.send()
+        self._start_timer()
+
+    @override
+    def close(self) -> None:
+        self.timer.cancel()
+        with self._lock:
+            self.send()
+        return super().close()
+
+    def _emit(
+        self, record: LogRecord, formatted_lines: list[str], formatted_lines_len: int
+    ) -> None:
+        if formatted_lines_len >= self.config.max_len:
+            # new message is too large, new message can't fit info buffer,
+            # send buffered message and also send new message
+            for line in formatted_lines:
+                if self.buffer_message_len + len(line) >= self.config.max_len:
+                    self.send()
+
+                    self.buffer.append((record, [line]))
+                    self.buffer_message_len += len(line) + 1
+                else:
+                    self.buffer.append((record, [line]))
+                    self.buffer_message_len += len(line) + 1
+
+            self.send()
+        elif self.buffer_message_len + formatted_lines_len >= self.config.max_len:
+            # buffered message + new message is too large, but new message can fit into buffer,
+            # send buffered message and move new message into buffer
+            self.send()
+
+            self.buffer.append((record, formatted_lines))
+            self.buffer_message_len += formatted_lines_len + 1
+        else:
+            # buffered message + new message fits info buffer, append it
+            self.buffer.append((record, formatted_lines))
+            self.buffer_message_len += formatted_lines_len + 1
+
+        if self.auto_flush:
+            self.send()
 
     @override
     def emit(self, record: LogRecord) -> None:
@@ -227,34 +296,10 @@ class DiscordWebhookHandler(logging.Handler):
             formatted: tuple[list[str], int] = self.format(record)  # type: ignore[assignment]
             formatted_lines, formatted_lines_len = formatted
 
-            if formatted_lines_len >= self.config.max_len:
-                # new message is too large, new message can't fit info buffer,
-                # send buffered message and also send new message
-                for line in formatted_lines:
-                    if self.buffer_message_len + len(line) >= self.config.max_len:
-                        self.send()
+            with self._lock:
+                self.last_emit = time.monotonic()
+                self._emit(record, formatted_lines, formatted_lines_len)
 
-                        self.buffer.append((record, [line]))
-                        self.buffer_message_len += len(line) + 1
-                    else:
-                        self.buffer.append((record, [line]))
-                        self.buffer_message_len += len(line) + 1
-
-                self.send()
-            elif self.buffer_message_len + formatted_lines_len >= self.config.max_len:
-                # buffered message + new message is too large, but new message can fit into buffer,
-                # send buffered message and move new message into buffer
-                self.send()
-
-                self.buffer.append((record, formatted_lines))
-                self.buffer_message_len += formatted_lines_len + 1
-            else:
-                # buffered message + new message fits info buffer, append it
-                self.buffer.append((record, formatted_lines))
-                self.buffer_message_len += formatted_lines_len + 1
-
-            if self.auto_flush:
-                self.send()
         except Exception:  # noqa: BLE001
             self.handleError(record)
 
@@ -334,7 +379,7 @@ class DiscordWebhookHandler(logging.Handler):
         # prepare message for sending, exclude last \n char
         payload = {
             "content": self.config.template.format(
-                hostname=socket.gethostname(), text=log_message[:-1]
+                hostname=socket.gethostname(), title=self.config.title, text=log_message[:-1]
             )
         }
 
@@ -347,13 +392,14 @@ class DiscordWebhookHandler(logging.Handler):
         r: requests.Response | None = None
         # few lines of sending code from https://github.com/2press/discord-logger
         for _ in range(max_retries - 1):
-            with self._lock:
+            with self._sema:
                 r = requests.post(self.webhook_url, json=payload, timeout=DISCORD_TIMEOUT)
 
             if r.status_code == http.HTTPStatus.TOO_MANY_REQUESTS:
                 retry_after = int(r.headers.get("Retry-After", 500)) / 100.0
                 time.sleep(retry_after)
             elif r.status_code < http.HTTPStatus.BAD_REQUEST:
+                self.last_sent = datetime.now(tz=timezone.utc)
                 self.buffer.clear()
                 self.buffer_message_len = 0
                 return
@@ -435,15 +481,48 @@ def wrap_program(
     logger.error("", exc_info=(Exit, Exit(code, stderr), None))
 
 
-def main() -> int:
-    """Main entrypoint."""
-    dotenv_path = dotenv.find_dotenv(usecwd=True)
-    dotenv.load_dotenv(dotenv_path)
-    app = typer.Typer(add_completion=False, pretty_exceptions_enable=False)
-    app.command(context_settings={"ignore_unknown_options": True})(wrap_program)
-    app()
-    return 0
+def grep_logger(
+    webhook: Annotated[str, typer.Option(envvar="DISCORD_WEBHOOK", help="Discord Webhook URL.")],
+    patterns: Annotated[
+        list[str] | None, typer.Argument(help="Regex patterns to match stdout.")
+    ] = None,
+    title: Annotated[str | None, typer.Option(help="Title.")] = None,
+    only_log: Annotated[bool, typer.Option(help="Forward only matched stdout lines.")] = False,
+) -> None:
+    """Log matching lines from stdout to Discord."""
+    compiled = [re.compile(p) for p in (patterns or [])]
+
+    # set up logger
+    logger = logging.getLogger("dissi")
+    logger.setLevel(logging.INFO)
+    config = DiscordWebhookConfig(title=title)
+    formatter = DiscordWebhookFormatter(config=config)
+    handler = DiscordWebhookHandler(webhook_url=webhook, formatter=formatter)
+    logger.addHandler(handler)
+
+    def log_line(line: str) -> None:
+        if not line:
+            return
+        if any(c.search(line) for c in compiled):
+            logger.info(line)
+            sys.stdout.write(line + "\n")  # always log matched lines
+        elif not only_log:
+            sys.stdout.write(line + "\n")
+
+    buffer = ""
+    for line in sys.stdin:
+        buffer += line
+        if "\n" in buffer:
+            first, buffer = buffer.split("\n", maxsplit=1)
+            log_line(first)
+    log_line(buffer)
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+def wrap_program_cli() -> None:
+    """Entrypoint for wrapper."""
+    _typer_app(wrap_program, context={"ignore_unknown_options": True})
+
+
+def grep_logger_cli() -> None:
+    """Entrypoint for the grep logger."""
+    _typer_app(grep_logger)
