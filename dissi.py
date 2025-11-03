@@ -245,10 +245,13 @@ class DiscordWebhookHandler(logging.Handler):
             raise ValueError(f"No error found in record: {record}")
 
         exc_type, exc_val, exc_tb = record.exc_info
+        
         code = 1
         suffix = "failed"
         color = DiscordColors.RED
+        
         tb_text = "".join(traceback.format_exception(exc_type, exc_val, exc_tb))
+        
         if isinstance(exc_val, KeyboardInterrupt):
             suffix = "interrupted"
             color = DiscordColors.YELLOW
@@ -259,6 +262,9 @@ class DiscordWebhookHandler(logging.Handler):
             if code == 0:
                 suffix = "succeed"
                 color = DiscordColors.GREEN
+            if code == 130: # SIGINT
+                suffix = "interrupted"
+                color = DiscordColors.YELLOW
 
         cap_cmd = " ".join(sys.argv)[:100]
         cap_path = str(Path().cwd())[-100:]
@@ -357,12 +363,13 @@ def wrap_module(
     try:
         try:
             runpy.run_path(sys.argv[0], run_name="__main__")
+            code = 0
         except SyntaxError:
-            subprocess.Popen(sys.argv).wait()  # noqa: S603
+            code = subprocess.Popen(sys.argv).wait()  # noqa: S603
     except BaseException:
         logger.exception("")
         raise
-    logger.error("", exc_info=(SystemExit, SystemExit(0), None))
+    logger.error("", exc_info=(SystemExit, SystemExit(code), None))
 
 
 def main() -> None:
