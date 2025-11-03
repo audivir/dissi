@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
     from logging import Logger, LogRecord, _FormatStyle, _Level
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 SIGINT_EXIT_CODE = 130
 
@@ -380,6 +380,7 @@ def wrap_program(
 ) -> None:
     """Wrap a python script or other program in a Discord logging environment."""
     import runpy
+
     if force_exec and force_py:
         typer.echo("--force-exec not allowed with --force-py", err=True)
         raise typer.Exit(code=1)
@@ -436,7 +437,8 @@ def wrap_program(
 
 def main() -> int:
     """Main entrypoint."""
-    dotenv.load_dotenv()
+    dotenv_path = dotenv.find_dotenv(usecwd=True)
+    dotenv.load_dotenv(dotenv_path)
     app = typer.Typer(add_completion=False, pretty_exceptions_enable=False)
     app.command(context_settings={"ignore_unknown_options": True})(wrap_program)
     app()
