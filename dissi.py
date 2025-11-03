@@ -6,6 +6,7 @@ import atexit
 import http
 import logging
 import os
+import shlex
 import shutil
 import socket
 import subprocess
@@ -20,12 +21,51 @@ from typing import TYPE_CHECKING, Annotated, Any
 import dotenv
 import requests
 import typer
+from typing_extensions import override
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
     from logging import Logger, LogRecord, _FormatStyle, _Level
 
 __version__ = "0.1.0"
+
+SIGINT_EXIT_CODE = 130
+
+
+class Exit(Exception):  # noqa: N818
+    """Custom SystemExit."""
+
+    def __init__(self, code: sys._ExitCode, stderr: str) -> None:
+        """Initialize the exit."""
+        super().__init__()
+        self.code = code
+        self.stderr = stderr
+
+
+def _cap_cmd(args: list[str] | None = None, max_chars: int = 100) -> str:
+    if not args:
+        args = sys.argv
+    return " ".join(shlex.quote(a) for a in args)[:max_chars]
+
+
+def _cap_cwd(cwd: Path | None = None, max_chars: int = 100) -> str:
+    if not cwd:
+        cwd = Path().cwd()
+    return str(cwd)[-max_chars:]
+
+
+def _run_program(args: list[str] | None = None) -> tuple[int, str]:
+    if not args:
+        args = sys.argv
+    proc = subprocess.Popen(args, stderr=subprocess.PIPE, text=True)  # noqa: S603
+    stderr_lines: list[str] = []
+    if proc.stderr:
+        for line in proc.stderr:
+            sys.stderr.write(line)
+            stderr_lines.append(line)
+    code = proc.wait()
+    stderr = "".join(stderr_lines)
+    return code, stderr
 
 
 def _flush(self: Logger) -> None:
@@ -36,7 +76,7 @@ def _flush(self: Logger) -> None:
 
 # Adding flush method to Logger class
 # used for forced sending all buffered data
-logging.Logger.flush = _flush
+logging.Logger.flush = _flush  # type: ignore[attr-defined]
 
 DISCORD_TIMEOUT = 5
 MAX_DISCORD_MESSAGE_LEN = 2000
@@ -96,10 +136,11 @@ class DiscordWebhookFormatter(logging.Formatter):
         config: DiscordWebhookConfig | None = None,
     ) -> None:
         """Initialize a Discord Webhook formatter."""
-        super().__init__(fmt, datefmt, style, validate, defaults=defaults)
+        super().__init__(fmt, datefmt, style, validate, defaults=defaults)  # type:ignore[call-arg]
         self.config = config or DiscordWebhookConfig()
 
-    def format(self, record: LogRecord) -> tuple[list[str], int]:
+    @override
+    def format(self, record: LogRecord) -> tuple[list[str], int]:  # type:ignore[override]
         """Format a LogRecord for Discord."""
         level_prefix = self.config.prefixes.get(record.levelname, " " * self.config.prefix_len)
 
@@ -160,8 +201,9 @@ class DiscordWebhookHandler(logging.Handler):
         """Initialize the Discord Webhook handler."""
         super().__init__(level)
         self.webhook_url = webhook_url
-        self.formatter: DiscordWebhookFormatter = formatter or DiscordWebhookFormatter()
+        self.formatter: DiscordWebhookFormatter = formatter or DiscordWebhookFormatter()  # type:ignore[mutable-override]
         self.config = self.formatter.config
+        # Limit concurrent requests to avoid hitting rate limits.
         self._lock = Semaphore(5)
 
         self.auto_flush = auto_flush
@@ -173,6 +215,7 @@ class DiscordWebhookHandler(logging.Handler):
         # send all remaining buffered messages before app exit
         atexit.register(self.send)
 
+    @override
     def emit(self, record: LogRecord) -> None:
         """Add the log record to the buffered messages."""
         if record.exc_info is not None:
@@ -181,7 +224,7 @@ class DiscordWebhookHandler(logging.Handler):
             return
 
         try:
-            formatted: tuple[list[str], int] = self.format(record)
+            formatted: tuple[list[str], int] = self.format(record)  # type: ignore[assignment]
             formatted_lines, formatted_lines_len = formatted
 
             if formatted_lines_len >= self.config.max_len:
@@ -224,7 +267,7 @@ class DiscordWebhookHandler(logging.Handler):
         record: LogRecord | None = None,
     ) -> None:
         """Send a Discord embed message."""
-        embed = {"title": f"{socket.gethostname()[:100]} {suffix}!"}
+        embed: dict[str, Any] = {"title": f"{socket.gethostname()[:100]} {suffix}!"}
         if description:
             embed["description"] = description
         if color is not None:
@@ -245,31 +288,28 @@ class DiscordWebhookHandler(logging.Handler):
             raise ValueError(f"No error found in record: {record}")
 
         exc_type, exc_val, exc_tb = record.exc_info
-        
+
         code = 1
         suffix = "failed"
         color = DiscordColors.RED
-        
+
         tb_text = "".join(traceback.format_exception(exc_type, exc_val, exc_tb))
-        
+
         if isinstance(exc_val, KeyboardInterrupt):
             suffix = "interrupted"
             color = DiscordColors.YELLOW
-        elif isinstance(exc_val, SystemExit):
-            code = exc_val.code
-            if not isinstance(code, int):
-                code = 0
+        elif isinstance(exc_val, (SystemExit, Exit)):
+            code = exc_val.code if isinstance(exc_val.code, int) else 0
             if code == 0:
                 suffix = "succeed"
                 color = DiscordColors.GREEN
-            if code == 130: # SIGINT
+            if code == SIGINT_EXIT_CODE:
                 suffix = "interrupted"
                 color = DiscordColors.YELLOW
+            if isinstance(exc_val, Exit):
+                tb_text = exc_val.stderr
 
-        cap_cmd = " ".join(sys.argv)[:100]
-        cap_path = str(Path().cwd())[-100:]
-
-        description = f"Command: {cap_cmd}\nWorking Directory: {cap_path}\nReturn Code: {code}"
+        description = f"Command: {_cap_cmd()}\nWorking Directory: {_cap_cwd()}\nReturn Code: {code}"
         if msg := record.getMessage():
             description += f"\nMessage: {msg[:500]}"
         # limit length
@@ -300,10 +340,11 @@ class DiscordWebhookHandler(logging.Handler):
 
         self._send(record, payload)
 
-    def _send(self, record: LogRecord, payload: dict[str, str]) -> None:
+    def _send(self, record: LogRecord, payload: dict[str, Any]) -> None:
         """Send a payload."""
         max_retries = 3
 
+        r: requests.Response | None = None
         # few lines of sending code from https://github.com/2press/discord-logger
         for _ in range(max_retries - 1):
             with self._lock:
@@ -312,72 +353,94 @@ class DiscordWebhookHandler(logging.Handler):
             if r.status_code == http.HTTPStatus.TOO_MANY_REQUESTS:
                 retry_after = int(r.headers.get("Retry-After", 500)) / 100.0
                 time.sleep(retry_after)
-                continue
-            if r.status_code < http.HTTPStatus.BAD_REQUEST:
-                break
-            continue
-
-        self.buffer.clear()
-        self.buffer_message_len = 0
+            elif r.status_code < http.HTTPStatus.BAD_REQUEST:
+                self.buffer.clear()
+                self.buffer_message_len = 0
+                return
 
         try:
-            r.raise_for_status()
+            if r:
+                r.raise_for_status()
         except Exception:  # noqa: BLE001
             self.handleError(record)
 
 
-def wrap_module(
-    program: str,
-    webhook: Annotated[str, typer.Option(envvar="DISCORD_WEBHOOK")],
-    args: Annotated[list[str] | None, typer.Argument()] = None,
+def wrap_program(
+    program: Annotated[str, typer.Argument(help="Script or program to wrap.")],
+    webhook: Annotated[str, typer.Option(envvar="DISCORD_WEBHOOK", help="Discord Webhook URL.")],
+    args: Annotated[
+        list[str] | None, typer.Argument(help="Arguments for the wrapped program.")
+    ] = None,
+    force_exec: Annotated[
+        bool, typer.Option(help="Force the use of subprocess instead of trying to use runpy.")
+    ] = False,
+    force_py: Annotated[
+        bool, typer.Option(help="Force the use of runpy instead of trying to use subprocess.")
+    ] = False,
 ) -> None:
-    """Wrap a python script in a Discord logging environment.
-
-    Arguments:
-        program: Program to wrap.
-        webhook: Discord Webhook URL.
-        args: Arguments for the wrapped program.
-    """
+    """Wrap a python script or other program in a Discord logging environment."""
     import runpy
+    if force_exec and force_py:
+        typer.echo("--force-exec not allowed with --force-py", err=True)
+        raise typer.Exit(code=1)
 
+    orig_program = program
     if os.sep not in program:
+        # try to locate program in PATH
         executable = shutil.which(program)
         if executable:
             program = executable
 
+    # try to locate the executable
     if not Path(program).is_file():
-        print("Program not found!")
+        typer.echo(f"{orig_program} not found", err=True)
         raise typer.Exit(code=1)
 
+    # set up logger
     logger = logging.getLogger("dissi")
     handler = DiscordWebhookHandler(webhook_url=webhook)
     logger.addHandler(handler)
+
+    # set new args
     sys.argv = [program, *(args or [])]
 
-    cap_cmd = " ".join(sys.argv)[:100]
-    cap_path = str(Path().cwd())[-100:]
-
+    # log the start of the program
     handler.send_embed(
-        "started", f"Command: {cap_cmd}\nWorking Directory: {cap_path}", DiscordColors.LIGHT_BLUE
+        "started",
+        f"Command: {_cap_cmd()}\nWorking Directory: {_cap_cwd()}",
+        DiscordColors.LIGHT_BLUE,
     )
+
+    code = 0
+    stderr = ""
     try:
-        try:
-            runpy.run_path(sys.argv[0], run_name="__main__")
-            code = 0
-        except SyntaxError:
-            code = subprocess.Popen(sys.argv).wait()  # noqa: S603
+        # if not forced, try to run in as python module first,
+        # if it fails, run it as normal executable.
+        if force_exec:
+            code, stderr = _run_program()
+        else:
+            try:
+                runpy.run_path(sys.argv[0], run_name="__main__")
+            except SyntaxError:
+                if force_py:
+                    raise
+                code, stderr = _run_program()
+
     except BaseException:
+        # log any occuring error
         logger.exception("")
         raise
-    logger.error("", exc_info=(SystemExit, SystemExit(code), None))
+    # log successful exits or failed exits from normal executables
+    logger.error("", exc_info=(Exit, Exit(code, stderr), None))
 
 
-def main() -> None:
+def main() -> int:
     """Main entrypoint."""
     dotenv.load_dotenv()
     app = typer.Typer(add_completion=False, pretty_exceptions_enable=False)
-    app.command(context_settings={"ignore_unknown_options": True})(wrap_module)
+    app.command(context_settings={"ignore_unknown_options": True})(wrap_program)
     app()
+    return 0
 
 
 if __name__ == "__main__":
