@@ -21,7 +21,6 @@ dev = ["ruff", "mypy", "pytest", "coverage[toml]", "vulture"]
 
 [project.scripts]
 dissi = "dissi:wrap_program_cli"
-dissi-grep = "dissi:grep_logger_cli"
 
 [tool.setuptools]
 dynamic = { version = { attr = "dissi.__version__" } }

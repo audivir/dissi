@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import atexit
+import concurrent.futures
 import http
 import logging
 import os
 import re
+import runpy
 import shlex
 import shutil
 import socket
@@ -18,7 +20,7 @@ from datetime import datetime, timezone
 from enum import IntEnum
 from pathlib import Path
 from threading import Lock, Semaphore, Timer
-from typing import TYPE_CHECKING, Annotated, Any
+from typing import IO, TYPE_CHECKING, Annotated, Any
 
 import dotenv
 import requests
@@ -32,6 +34,10 @@ if TYPE_CHECKING:
 __version__ = "0.1.1"
 
 SIGINT_EXIT_CODE = 130
+
+# The regex pattern for common ANSI color/style codes
+ANSI_PATTERN = re.compile(r"\x1b\[[0-9;]*m")
+MAX_RETRIES = 3
 
 
 class Exit(Exception):  # noqa: N818
@@ -75,6 +81,73 @@ def _run_program(args: list[str] | None = None) -> tuple[int, str]:
             stderr_lines.append(line)
     code = proc.wait()
     stderr = "".join(stderr_lines)
+    return code, stderr
+
+
+def _log_line(
+    line: str, err: bool, compiled: list[re.Pattern[str]], logger: Logger, only_log: bool
+) -> None:
+    if not line:
+        return
+    level = logging.ERROR if err else logging.INFO
+    stream = sys.stderr if err else sys.stdout
+
+    if any(c.search(line) for c in compiled):
+        logger.log(level, ANSI_PATTERN.sub("", line))
+        stream.write(line + "\n")  # always log matched lines
+    elif not only_log:
+        stream.write(line + "\n")
+
+
+def _log_buffer(
+    stream: IO[str], err: bool, compiled: list[re.Pattern[str]], logger: Logger, only_log: bool
+) -> str:
+    full: list[str] = []
+    buffer = ""
+    for line in stream:
+        if err:
+            full.append(line)
+        buffer += line
+        if "\n" in buffer:
+            first, buffer = buffer.split("\n", maxsplit=1)
+            _log_line(first, err, compiled, logger, only_log)
+    _log_line(buffer, err, compiled, logger, only_log)
+
+    return "".join(full)
+
+
+def _run_grep(
+    grep: list[str], only_log: bool, logger: Logger, args: list[str] | None = None
+) -> tuple[int, str]:
+    """Log matching lines from stdout to Discord."""
+    if not args:
+        args = sys.argv
+    compiled = [re.compile(p) for p in grep]
+
+    proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)  # noqa: S603
+
+    if not proc.stdout or not proc.stderr:
+        raise RuntimeError("Streams not piped")
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        _ = executor.submit(
+            _log_buffer,
+            stream=proc.stdout,
+            err=False,
+            compiled=compiled,
+            logger=logger,
+            only_log=only_log,
+        )
+        f_err = executor.submit(
+            _log_buffer,
+            stream=proc.stderr,
+            err=True,
+            compiled=compiled,
+            logger=logger,
+            only_log=only_log,
+        )
+
+        stderr = f_err.result()
+    code = proc.wait()
     return code, stderr
 
 
@@ -387,11 +460,10 @@ class DiscordWebhookHandler(logging.Handler):
 
     def _send(self, record: LogRecord, payload: dict[str, Any]) -> None:
         """Send a payload."""
-        max_retries = 3
 
         r: requests.Response | None = None
         # few lines of sending code from https://github.com/2press/discord-logger
-        for _ in range(max_retries - 1):
+        for _ in range(MAX_RETRIES):
             with self._sema:
                 r = requests.post(self.webhook_url, json=payload, timeout=DISCORD_TIMEOUT)
 
@@ -400,6 +472,7 @@ class DiscordWebhookHandler(logging.Handler):
                 time.sleep(retry_after)
             elif r.status_code < http.HTTPStatus.BAD_REQUEST:
                 self.last_sent = datetime.now(tz=timezone.utc)
+                # clear on success
                 self.buffer.clear()
                 self.buffer_message_len = 0
                 return
@@ -409,43 +482,28 @@ class DiscordWebhookHandler(logging.Handler):
                 r.raise_for_status()
         except Exception:  # noqa: BLE001
             self.handleError(record)
+            # clear on failure
+            self.buffer.clear()
+            self.buffer_message_len = 0
 
 
 def wrap_program(
-    program: Annotated[str, typer.Argument(help="Script or program to wrap.")],
-    webhook: Annotated[str, typer.Option(envvar="DISCORD_WEBHOOK", help="Discord Webhook URL.")],
-    args: Annotated[
-        list[str] | None, typer.Argument(help="Arguments for the wrapped program.")
-    ] = None,
-    force_exec: Annotated[
-        bool, typer.Option(help="Force the use of subprocess instead of trying to use runpy.")
-    ] = False,
-    force_py: Annotated[
-        bool, typer.Option(help="Force the use of runpy instead of trying to use subprocess.")
-    ] = False,
+    webhook: str,
+    program: str,
+    args: list[str] | None,
+    force_exec: bool,
+    force_py: bool,
+    grep: list[str] | None,
+    title: str | None,
+    only_log: bool,
 ) -> None:
     """Wrap a python script or other program in a Discord logging environment."""
-    import runpy
-
-    if force_exec and force_py:
-        typer.echo("--force-exec not allowed with --force-py", err=True)
-        raise typer.Exit(code=1)
-
-    orig_program = program
-    if os.sep not in program:
-        # try to locate program in PATH
-        executable = shutil.which(program)
-        if executable:
-            program = executable
-
-    # try to locate the executable
-    if not Path(program).is_file():
-        typer.echo(f"{orig_program} not found", err=True)
-        raise typer.Exit(code=1)
-
     # set up logger
     logger = logging.getLogger("dissi")
-    handler = DiscordWebhookHandler(webhook_url=webhook)
+    logger.setLevel(logging.INFO)
+    config = DiscordWebhookConfig(title=title)
+    formatter = DiscordWebhookFormatter(config=config)
+    handler = DiscordWebhookHandler(webhook_url=webhook, formatter=formatter)
     logger.addHandler(handler)
 
     # set new args
@@ -463,7 +521,9 @@ def wrap_program(
     try:
         # if not forced, try to run in as python module first,
         # if it fails, run it as normal executable.
-        if force_exec:
+        if grep:
+            code, stderr = _run_grep(grep, only_log, logger)
+        elif force_exec:
             code, stderr = _run_program()
         else:
             try:
@@ -481,48 +541,50 @@ def wrap_program(
     logger.error("", exc_info=(Exit, Exit(code, stderr), None))
 
 
-def grep_logger(
+def wrap_program_typer(
+    program: Annotated[str, typer.Argument(help="Script or program to wrap.")],
     webhook: Annotated[str, typer.Option(envvar="DISCORD_WEBHOOK", help="Discord Webhook URL.")],
-    patterns: Annotated[
-        list[str] | None, typer.Argument(help="Regex patterns to match stdout.")
+    args: Annotated[
+        list[str] | None, typer.Argument(help="Arguments for the wrapped program.")
     ] = None,
+    force_exec: Annotated[
+        bool, typer.Option(help="Force the use of subprocess instead of trying to use runpy.")
+    ] = False,
+    force_py: Annotated[
+        bool, typer.Option(help="Force the use of runpy instead of trying to use subprocess.")
+    ] = False,
+    grep: Annotated[list[str] | None, typer.Option(help="Regex patterns to match stdout.")] = None,
     title: Annotated[str | None, typer.Option(help="Title.")] = None,
     only_log: Annotated[bool, typer.Option(help="Forward only matched stdout lines.")] = False,
 ) -> None:
-    """Log matching lines from stdout to Discord."""
-    compiled = [re.compile(p) for p in (patterns or [])]
+    """Wrap a python script or other program in a Discord logging environment."""
+    if force_exec and force_py:
+        typer.echo("--force-exec not allowed with --force-py", err=True)
+        raise typer.Exit(code=1)
 
-    # set up logger
-    logger = logging.getLogger("dissi")
-    logger.setLevel(logging.INFO)
-    config = DiscordWebhookConfig(title=title)
-    formatter = DiscordWebhookFormatter(config=config)
-    handler = DiscordWebhookHandler(webhook_url=webhook, formatter=formatter)
-    logger.addHandler(handler)
+    if grep and force_py:
+        typer.echo("--force-py is unsupported, when --grep patterns are provided", err=True)
+        raise typer.Exit(code=1)
 
-    def log_line(line: str) -> None:
-        if not line:
-            return
-        if any(c.search(line) for c in compiled):
-            logger.info(line)
-            sys.stdout.write(line + "\n")  # always log matched lines
-        elif not only_log:
-            sys.stdout.write(line + "\n")
+    if not grep and (title or only_log):
+        typer.echo("--title and --only-log are ignored without --grep patterns", err=True)
+        title = None
 
-    buffer = ""
-    for line in sys.stdin:
-        buffer += line
-        if "\n" in buffer:
-            first, buffer = buffer.split("\n", maxsplit=1)
-            log_line(first)
-    log_line(buffer)
+    orig_program = program
+    if os.sep not in program:
+        # try to locate program in PATH
+        executable = shutil.which(program)
+        if executable:
+            program = executable
+
+    # try to locate the executable
+    if not Path(program).is_file():
+        typer.echo(f"{orig_program} not found", err=True)
+        raise typer.Exit(code=1)
+
+    wrap_program(webhook, program, args, force_exec, force_py, grep, title, only_log)
 
 
 def wrap_program_cli() -> None:
     """Entrypoint for wrapper."""
-    _typer_app(wrap_program, context={"ignore_unknown_options": True})
-
-
-def grep_logger_cli() -> None:
-    """Entrypoint for the grep logger."""
-    _typer_app(grep_logger)
+    _typer_app(wrap_program_typer, context={"ignore_unknown_options": True})
