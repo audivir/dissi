@@ -585,6 +585,10 @@ def wrap_program_typer(
     wrap_program(webhook, program, args, force_exec, force_py, grep, title, only_log)
 
 
-def wrap_program_cli() -> None:
+def wrap_program_cli() -> int:
     """Entrypoint for wrapper."""
     _typer_app(wrap_program_typer, context={"ignore_unknown_options": True})
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(wrap_program_cli())
