@@ -11,6 +11,7 @@ import re
 import runpy
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -30,14 +31,16 @@ from typing_extensions import override
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
     from logging import Logger, LogRecord, _FormatStyle, _Level
+    from types import FrameType
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 SIGINT_EXIT_CODE = 130
 
 # The regex pattern for common ANSI color/style codes
 ANSI_PATTERN = re.compile(r"\x1b\[[0-9;]*m")
 MAX_RETRIES = 3
+SIGNALS_TO_HANDLE = (signal.SIGTERM, ) # signal.SIGKILL)
 
 
 class Exit(Exception):  # noqa: N818
@@ -68,6 +71,22 @@ def _cap_cwd(cwd: Path | None = None, max_chars: int = 100) -> str:
     if not cwd:
         cwd = Path().cwd()
     return str(cwd)[-max_chars:]
+
+
+def _setup_signal_handling(handler: DiscordWebhookHandler) -> None:
+    def handle_signal(signo: int, frame: FrameType) -> None:
+        del frame  # unused
+        handler.send_embed(
+            f"received {signal.Signals(signo).name}",
+            f"Command: {_cap_cmd()}\nWorking Directory: {_cap_cwd()}",
+            DiscordColors.RED,
+        )
+        # propagate the original handling
+        signal.signal(signo, signal.SIG_DFL)
+        os.kill(os.getpid(), signo)
+
+    for signo in SIGNALS_TO_HANDLE:
+        signal.signal(signo, handle_signal)
 
 
 def _run_program(args: list[str] | None = None) -> tuple[int, str]:
@@ -460,7 +479,6 @@ class DiscordWebhookHandler(logging.Handler):
 
     def _send(self, record: LogRecord, payload: dict[str, Any]) -> None:
         """Send a payload."""
-
         r: requests.Response | None = None
         # few lines of sending code from https://github.com/2press/discord-logger
         for _ in range(MAX_RETRIES):
@@ -509,6 +527,9 @@ def wrap_program(
     # set new args
     sys.argv = [program, *(args or [])]
 
+    # set up signal handling
+    _setup_signal_handling(handler)
+
     # log the start of the program
     handler.send_embed(
         "started",
@@ -528,7 +549,11 @@ def wrap_program(
         else:
             try:
                 runpy.run_path(sys.argv[0], run_name="__main__")
-            except SyntaxError:
+            except (SyntaxError, ValueError) as e:
+                if isinstance(e, ValueError) and e.args != (
+                    "source code string cannot contain null bytes",
+                ):
+                    raise
                 if force_py:
                     raise
                 code, stderr = _run_program()
@@ -589,6 +614,7 @@ def wrap_program_cli() -> int:
     """Entrypoint for wrapper."""
     _typer_app(wrap_program_typer, context={"ignore_unknown_options": True})
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(wrap_program_cli())
