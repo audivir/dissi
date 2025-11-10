@@ -33,14 +33,14 @@ if TYPE_CHECKING:
     from logging import Logger, LogRecord, _FormatStyle, _Level
     from types import FrameType
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 SIGINT_EXIT_CODE = 130
 
 # The regex pattern for common ANSI color/style codes
 ANSI_PATTERN = re.compile(r"\x1b\[[0-9;]*m")
 MAX_RETRIES = 3
-SIGNALS_TO_HANDLE = (signal.SIGTERM, ) # signal.SIGKILL)
+SIGNALS_TO_HANDLE = (signal.SIGTERM,)
 
 
 class Exit(Exception):  # noqa: N818
@@ -433,6 +433,7 @@ class DiscordWebhookHandler(logging.Handler):
         tb_text = "".join(traceback.format_exception(exc_type, exc_val, exc_tb))
 
         if isinstance(exc_val, KeyboardInterrupt):
+            code = SIGINT_EXIT_CODE
             suffix = "interrupted"
             color = DiscordColors.YELLOW
         elif isinstance(exc_val, (SystemExit, Exit)):
@@ -547,6 +548,7 @@ def wrap_program(
         elif force_exec:
             code, stderr = _run_program()
         else:
+            run_as_py = True
             try:
                 runpy.run_path(sys.argv[0], run_name="__main__")
             except (SyntaxError, ValueError) as e:
@@ -556,6 +558,8 @@ def wrap_program(
                     raise
                 if force_py:
                     raise
+                run_as_py = False
+            if not run_as_py:
                 code, stderr = _run_program()
 
     except BaseException:
