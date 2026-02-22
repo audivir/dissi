@@ -5,8 +5,8 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "dissi"
 dynamic = ["version"]
-dependencies = ["typer", "dotenv", "requests"]
-requires-python = ">=3.9"
+dependencies = ["doctyper", "dotenv", "httpx"]
+requires-python = ">=3.10"
 authors = [{ name = "Tim Hörmann", email = "pypi@audivir.de" }]
 description = "Discord Logger and Wrapper."
 readme = "README.md"
@@ -20,14 +20,13 @@ Repository = "https://github.com/audivir/dissi"
 dev = ["ruff", "mypy", "pytest", "coverage[toml]", "vulture"]
 
 [project.scripts]
-dissi = "dissi:wrap_program_cli"
+dissi = "dissi.cli:main"
 
 [tool.setuptools]
 dynamic = { version = { attr = "dissi.__version__" } }
-py-modules = ["dissi"]
 
 [tool.mypy]
-python_version = "3.9"
+python_version = "3.10"
 strict = true
 disable_error_code = "import-untyped"
 enable_error_code = """type-arg,no-untyped-def,redundant-cast,redundant-self,comparison-overlap,
@@ -87,7 +86,7 @@ show-fixes = true
 
 exclude = [".git", ".idea", ".mypy_cache", ".tox", ".venv", ".nox"]
 
-target-version = "py39"
+target-version = "py310"
 line-length = 100
 indent-width = 4
 

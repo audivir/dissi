@@ -10,7 +10,6 @@ import os
 import re
 import runpy
 import shlex
-import shutil
 import signal
 import socket
 import subprocess
@@ -21,19 +20,16 @@ from datetime import datetime, timezone
 from enum import IntEnum
 from pathlib import Path
 from threading import Lock, Semaphore, Timer
-from typing import IO, TYPE_CHECKING, Annotated, Any
+from typing import IO, TYPE_CHECKING, Any
 
-import dotenv
 import requests
-import typer
 from typing_extensions import override
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping, Sequence
+    from collections.abc import Mapping, Sequence
     from logging import Logger, LogRecord, _FormatStyle, _Level
     from types import FrameType
 
-__version__ = "0.1.3"
 
 SIGINT_EXIT_CODE = 130
 
@@ -51,14 +47,6 @@ class Exit(Exception):  # noqa: N818
         super().__init__()
         self.code = code
         self.stderr = stderr
-
-
-def _typer_app(func: Callable[..., None], context: dict[str, Any] | None = None) -> None:
-    dotenv_path = dotenv.find_dotenv(usecwd=True)
-    dotenv.load_dotenv(dotenv_path)
-    app = typer.Typer(add_completion=False, pretty_exceptions_enable=False)
-    app.command(context_settings=context)(func)
-    app()
 
 
 def _cap_cmd(args: list[str] | None = None, max_chars: int = 100) -> str:
@@ -568,57 +556,3 @@ def wrap_program(
         raise
     # log successful exits or failed exits from normal executables
     logger.error("", exc_info=(Exit, Exit(code, stderr), None))
-
-
-def wrap_program_typer(
-    program: Annotated[str, typer.Argument(help="Script or program to wrap.")],
-    webhook: Annotated[str, typer.Option(envvar="DISCORD_WEBHOOK", help="Discord Webhook URL.")],
-    args: Annotated[
-        list[str] | None, typer.Argument(help="Arguments for the wrapped program.")
-    ] = None,
-    force_exec: Annotated[
-        bool, typer.Option(help="Force the use of subprocess instead of trying to use runpy.")
-    ] = False,
-    force_py: Annotated[
-        bool, typer.Option(help="Force the use of runpy instead of trying to use subprocess.")
-    ] = False,
-    grep: Annotated[list[str] | None, typer.Option(help="Regex patterns to match stdout.")] = None,
-    title: Annotated[str | None, typer.Option(help="Title.")] = None,
-    only_log: Annotated[bool, typer.Option(help="Forward only matched stdout lines.")] = False,
-) -> None:
-    """Wrap a python script or other program in a Discord logging environment."""
-    if force_exec and force_py:
-        typer.echo("--force-exec not allowed with --force-py", err=True)
-        raise typer.Exit(code=1)
-
-    if grep and force_py:
-        typer.echo("--force-py is unsupported, when --grep patterns are provided", err=True)
-        raise typer.Exit(code=1)
-
-    if not grep and (title or only_log):
-        typer.echo("--title and --only-log are ignored without --grep patterns", err=True)
-        title = None
-
-    orig_program = program
-    if os.sep not in program:
-        # try to locate program in PATH
-        executable = shutil.which(program)
-        if executable:
-            program = executable
-
-    # try to locate the executable
-    if not Path(program).is_file():
-        typer.echo(f"{orig_program} not found", err=True)
-        raise typer.Exit(code=1)
-
-    wrap_program(webhook, program, args, force_exec, force_py, grep, title, only_log)
-
-
-def wrap_program_cli() -> int:
-    """Entrypoint for wrapper."""
-    _typer_app(wrap_program_typer, context={"ignore_unknown_options": True})
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(wrap_program_cli())
