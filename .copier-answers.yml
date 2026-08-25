@@ -1,0 +1,11 @@
+# Changes here will be overwritten by Copier
+_commit: 1a45ad8
+_src_path: gh:audivir/copier-template
+author_email: pypi@audivir.de
+author_name: Tim Hörmann
+description: Discord Logger and Wrapper.
+github_org: audivir
+project_name: dissi
+project_slug: dissi
+project_type: python
+publishable: false

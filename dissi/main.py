@@ -30,46 +30,53 @@ if TYPE_CHECKING:
     from logging import Logger, LogRecord, _FormatStyle, _Level
     from types import FrameType
 
+    from _typeshed import StrPath
+
 
 SIGINT_EXIT_CODE = 130
 
-# The regex pattern for common ANSI color/style codes
+# regex pattern for common ANSI color/style codes.
 ANSI_PATTERN = re.compile(r"\x1b\[[0-9;]*m")
 MAX_RETRIES = 3
 SIGNALS_TO_HANDLE = (signal.SIGTERM,)
 
 
 class Exit(Exception):  # noqa: N818
-    """Custom SystemExit."""
+    """Mimics SystemExit while carrying the captured stderr of the wrapped program."""
 
     def __init__(self, code: sys._ExitCode, stderr: str) -> None:
-        """Initialize the exit."""
+        """Initializes the exit with a code and captured stderr."""
         super().__init__()
         self.code = code
         self.stderr = stderr
 
 
-def _cap_cmd(args: list[str] | None = None, max_chars: int = 100) -> str:
+def cap_cmd(args: Sequence[StrPath] | None = None, max_chars: int = 100) -> str:
+    """Joins and shell-quotes args, defaulting to `sys.argv`, truncated to max_chars."""
     if not args:
         args = sys.argv
-    return " ".join(shlex.quote(a) for a in args)[:max_chars]
+    return " ".join(shlex.quote(str(a)) for a in args)[:max_chars]
 
 
-def _cap_cwd(cwd: Path | None = None, max_chars: int = 100) -> str:
+def cap_cwd(cwd: StrPath | None = None, max_chars: int = 100) -> str:
+    """Returns cwd, defaulting to the current directory, truncated to its last max_chars."""
     if not cwd:
         cwd = Path().cwd()
     return str(cwd)[-max_chars:]
 
 
-def _setup_signal_handling(handler: DiscordWebhookHandler) -> None:
-    def handle_signal(signo: int, frame: FrameType) -> None:
+def setup_signal_handling(handler: DiscordWebhookHandler) -> None:
+    """Reports handled signals to Discord before restoring default signal handling."""
+
+    def handle_signal(signo: int, frame: FrameType | None) -> None:
         del frame  # unused
+        handler.send()  # flush already-buffered messages, `_send` below would drop them.
         handler.send_embed(
             f"received {signal.Signals(signo).name}",
-            f"Command: {_cap_cmd()}\nWorking Directory: {_cap_cwd()}",
+            f"Command: {cap_cmd()}\nWorking Directory: {cap_cwd()}",
             DiscordColors.RED,
         )
-        # propagate the original handling
+        # propagate the original handling.
         signal.signal(signo, signal.SIG_DFL)
         os.kill(os.getpid(), signo)
 
@@ -77,23 +84,25 @@ def _setup_signal_handling(handler: DiscordWebhookHandler) -> None:
         signal.signal(signo, handle_signal)
 
 
-def _run_program(args: list[str] | None = None) -> tuple[int, str]:
+def run_program(args: list[str] | None = None) -> tuple[int, str]:
+    """Runs args, defaulting to `sys.argv`, as a subprocess, streaming stderr live."""
     if not args:
         args = sys.argv
-    proc = subprocess.Popen(args, stderr=subprocess.PIPE, text=True)  # noqa: S603
-    stderr_lines: list[str] = []
-    if proc.stderr:
-        for line in proc.stderr:
-            sys.stderr.write(line)
-            stderr_lines.append(line)
-    code = proc.wait()
+    with subprocess.Popen(args, stderr=subprocess.PIPE, text=True) as proc:  # noqa: S603
+        stderr_lines: list[str] = []
+        if proc.stderr:  # pragma: no branch
+            for line in proc.stderr:
+                sys.stderr.write(line)
+                stderr_lines.append(line)
+        code = proc.wait()
     stderr = "".join(stderr_lines)
     return code, stderr
 
 
-def _log_line(
+def log_line(
     line: str, err: bool, compiled: list[re.Pattern[str]], logger: Logger, only_log: bool
 ) -> None:
+    """Logs line to Discord if it matches compiled and forwards it to stdout/stderr."""
     if not line:
         return
     level = logging.ERROR if err else logging.INFO
@@ -101,14 +110,15 @@ def _log_line(
 
     if any(c.search(line) for c in compiled):
         logger.log(level, ANSI_PATTERN.sub("", line))
-        stream.write(line + "\n")  # always log matched lines
+        stream.write(line + "\n")  # always log matched lines.
     elif not only_log:
         stream.write(line + "\n")
 
 
-def _log_buffer(
+def log_buffer(
     stream: IO[str], err: bool, compiled: list[re.Pattern[str]], logger: Logger, only_log: bool
 ) -> str:
+    """Reads stream line by line, forwarding each to `log_line`, and returns its full text."""
     full: list[str] = []
     buffer = ""
     for line in stream:
@@ -117,56 +127,57 @@ def _log_buffer(
         buffer += line
         if "\n" in buffer:
             first, buffer = buffer.split("\n", maxsplit=1)
-            _log_line(first, err, compiled, logger, only_log)
-    _log_line(buffer, err, compiled, logger, only_log)
+            log_line(first, err, compiled, logger, only_log)
+    log_line(buffer, err, compiled, logger, only_log)
 
     return "".join(full)
 
 
-def _run_grep(
+def run_grep(
     grep: list[str], only_log: bool, logger: Logger, args: list[str] | None = None
 ) -> tuple[int, str]:
-    """Log matching lines from stdout to Discord."""
+    """Runs args, defaulting to `sys.argv`, and logs matching stdout/stderr lines to Discord."""
     if not args:
         args = sys.argv
     compiled = [re.compile(p) for p in grep]
 
-    proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)  # noqa: S603
+    with subprocess.Popen(  # noqa: S603
+        args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    ) as proc:
+        if not proc.stdout or not proc.stderr:  # pragma: no cover
+            raise RuntimeError("Streams not piped")
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            _ = executor.submit(
+                log_buffer,
+                stream=proc.stdout,
+                err=False,
+                compiled=compiled,
+                logger=logger,
+                only_log=only_log,
+            )
+            f_err = executor.submit(
+                log_buffer,
+                stream=proc.stderr,
+                err=True,
+                compiled=compiled,
+                logger=logger,
+                only_log=only_log,
+            )
 
-    if not proc.stdout or not proc.stderr:
-        raise RuntimeError("Streams not piped")
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        _ = executor.submit(
-            _log_buffer,
-            stream=proc.stdout,
-            err=False,
-            compiled=compiled,
-            logger=logger,
-            only_log=only_log,
-        )
-        f_err = executor.submit(
-            _log_buffer,
-            stream=proc.stderr,
-            err=True,
-            compiled=compiled,
-            logger=logger,
-            only_log=only_log,
-        )
-
-        stderr = f_err.result()
-    code = proc.wait()
+            stderr = f_err.result()
+        code = proc.wait()
     return code, stderr
 
 
-def _flush(self: Logger) -> None:
+def flush(self: Logger) -> None:
+    """Sends all buffered messages of every `DiscordWebhookHandler` attached to self."""
     for handler in self.handlers:
         if isinstance(handler, DiscordWebhookHandler):
             handler.send()
 
 
-# Adding flush method to Logger class
-# used for forced sending all buffered data
-logging.Logger.flush = _flush  # type: ignore[attr-defined]
+# adds a flush method to Logger for forced sending of all buffered data.
+logging.Logger.flush = flush  # type: ignore[attr-defined]
 
 DISCORD_TIMEOUT = 5
 MAX_DISCORD_MESSAGE_LEN = 2000
@@ -186,7 +197,7 @@ DIFF_LEVEL_PREFIXES = {
 
 
 class DiscordColors(IntEnum):
-    """Decimal color codes for Discord."""
+    """Stores decimal color codes for Discord embeds."""
 
     RED = 16711680
     YELLOW = 16776960
@@ -195,7 +206,7 @@ class DiscordColors(IntEnum):
 
 
 class DiscordWebhookConfig:
-    """Config for the template and prefixes."""
+    """Stores the message template, level prefixes, and computed length limits."""
 
     def __init__(
         self,
@@ -203,25 +214,29 @@ class DiscordWebhookConfig:
         prefixes: Mapping[str, str] | None = None,
         title: str | None = None,
     ) -> None:
-        """Initialize a Discord Webhook config."""
+        """Initializes a Discord Webhook config.
+
+        Raises:
+            ValueError: If prefixes has values of differing length.
+        """
         self.template = template or DIFF_MESSAGE_TEMPLATE
         self.prefixes = prefixes or DIFF_LEVEL_PREFIXES
         self.title = f": {title}" if title else ""
         template_len = len(
-            self.template.format(hostname=socket.gethostname(), title=title, text="")
+            self.template.format(hostname=socket.gethostname(), title=self.title, text="")
         )
         self.max_len = MAX_DISCORD_MESSAGE_LEN - template_len
 
         prefix_lens = {len(v) for v in self.prefixes.values()}
         self.prefix_len = prefix_lens.pop()
-        if prefix_lens:  # should be empty after removing the only element
+        if prefix_lens:  # should be empty after removing the only element.
             raise ValueError("All prefixes must have the same length")
 
 
 class DiscordWebhookFormatter(logging.Formatter):
-    """Format LogRecords for Discord."""
+    """Formats LogRecords into Discord-ready message lines."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         fmt: str | None = None,
         datefmt: str | None = None,
@@ -231,13 +246,17 @@ class DiscordWebhookFormatter(logging.Formatter):
         defaults: Mapping[str, Any] | None = None,
         config: DiscordWebhookConfig | None = None,
     ) -> None:
-        """Initialize a Discord Webhook formatter."""
-        super().__init__(fmt, datefmt, style, validate, defaults=defaults)  # type:ignore[call-arg]
+        """Initializes a Discord Webhook formatter."""
+        super().__init__(fmt, datefmt, style, validate, defaults=defaults)
         self.config = config or DiscordWebhookConfig()
 
     @override
     def format(self, record: LogRecord) -> tuple[list[str], int]:  # type:ignore[override]
-        """Format a LogRecord for Discord."""
+        """Formats a LogRecord into Discord-ready message lines.
+
+        Returns:
+            Formatted message lines and their combined character length, including separators.
+        """
         level_prefix = self.config.prefixes.get(record.levelname, " " * self.config.prefix_len)
 
         formatted_lines: list[str] = []
@@ -246,10 +265,8 @@ class DiscordWebhookFormatter(logging.Formatter):
         lines = record.getMessage().split("\n")
 
         for ix, line in enumerate(lines):
-            # if single log message has multiple lines, show it with using different separators
-            # Example:
-            # Log message: logger.info('1st line\nnext line\nlast line')
-            # Formatted output:
+            # a multi-line log message uses different separators per line, e.g.
+            # logger.info('1st line\nnext line\nlast line') becomes:
             # +  │1st line
             # +  ├next line
             # +  └last line
@@ -262,12 +279,11 @@ class DiscordWebhookFormatter(logging.Formatter):
 
             split_len = self.config.max_len - self.config.prefix_len - 1  # -1 = separator
             if len(line) > split_len:
-                # line is too long to send in single discord message,
-                # we need to split it in multiple messages
+                # line too long for a single Discord message, split across multiple messages.
                 formatted_lines.append(level_prefix + separator + line[:split_len])
-                formatted_lines_len += split_len
+                formatted_lines_len += len(formatted_lines[-1])
 
-                # use different separator to show, that line was split into multiple messages
+                # use a different separator to show that the line was split.
                 separator = "↳"
                 for segment in [
                     line[x : x + split_len] for x in range(split_len, len(line), split_len)
@@ -278,14 +294,14 @@ class DiscordWebhookFormatter(logging.Formatter):
                 formatted_lines.append(level_prefix + separator + line)
                 formatted_lines_len += len(formatted_lines[-1])
 
-        # add \n to char count
+        # add \n to char count.
         formatted_lines_len += len(formatted_lines) - 1
 
         return formatted_lines, formatted_lines_len
 
 
 class DiscordWebhookHandler(logging.Handler):
-    """A handler sending messages to Discord."""
+    """Manages buffering and rate-limited delivery of log records to a Discord webhook."""
 
     def __init__(
         self,
@@ -294,12 +310,12 @@ class DiscordWebhookHandler(logging.Handler):
         formatter: DiscordWebhookFormatter | None = None,
         level: _Level = 0,
     ) -> None:
-        """Initialize the Discord Webhook handler."""
+        """Initializes the Discord Webhook handler."""
         super().__init__(level)
         self.webhook_url = webhook_url
         self.formatter: DiscordWebhookFormatter = formatter or DiscordWebhookFormatter()  # type:ignore[mutable-override]
         self.config = self.formatter.config
-        # Limit concurrent requests to avoid hitting rate limits.
+        # limit concurrent requests to avoid hitting rate limits.
         self._sema = Semaphore(5)
         self._lock = Lock()
 
@@ -308,11 +324,11 @@ class DiscordWebhookHandler(logging.Handler):
         self.timer_interval = 60 / 30  # 30 messages per minute
         self._start_timer()
 
-        # buffer for storing shorter logs and sending them in larger batches
+        # buffer for storing shorter logs and sending them in larger batches.
         self.buffer: list[tuple[LogRecord, list[str]]] = []
         self.buffer_message_len = 0
 
-        # send all remaining buffered messages before app exit
+        # send all remaining buffered messages before app exit.
         atexit.register(self.send)
 
     def _start_timer(self) -> None:
@@ -327,6 +343,7 @@ class DiscordWebhookHandler(logging.Handler):
 
     @override
     def close(self) -> None:
+        """Flushes buffered messages and cancels the timer before closing."""
         self.timer.cancel()
         with self._lock:
             self.send()
@@ -336,28 +353,24 @@ class DiscordWebhookHandler(logging.Handler):
         self, record: LogRecord, formatted_lines: list[str], formatted_lines_len: int
     ) -> None:
         if formatted_lines_len >= self.config.max_len:
-            # new message is too large, new message can't fit info buffer,
-            # send buffered message and also send new message
+            # new message can't fit into the buffer, send buffered message and each new line.
             for line in formatted_lines:
                 if self.buffer_message_len + len(line) >= self.config.max_len:
                     self.send()
 
-                    self.buffer.append((record, [line]))
-                    self.buffer_message_len += len(line) + 1
-                else:
-                    self.buffer.append((record, [line]))
-                    self.buffer_message_len += len(line) + 1
+                self.buffer.append((record, [line]))
+                self.buffer_message_len += len(line) + 1
 
             self.send()
         elif self.buffer_message_len + formatted_lines_len >= self.config.max_len:
-            # buffered message + new message is too large, but new message can fit into buffer,
-            # send buffered message and move new message into buffer
+            # buffered message plus new message is too large, but new message fits into an
+            # empty buffer: send buffered message and move new message into buffer.
             self.send()
 
             self.buffer.append((record, formatted_lines))
             self.buffer_message_len += formatted_lines_len + 1
         else:
-            # buffered message + new message fits info buffer, append it
+            # buffered message plus new message fits into buffer, append it.
             self.buffer.append((record, formatted_lines))
             self.buffer_message_len += formatted_lines_len + 1
 
@@ -366,9 +379,9 @@ class DiscordWebhookHandler(logging.Handler):
 
     @override
     def emit(self, record: LogRecord) -> None:
-        """Add the log record to the buffered messages."""
+        """Adds the log record to the buffered messages."""
         if record.exc_info is not None:
-            self.send()  # send previous buffered message
+            self.send()  # send previous buffered message.
             self.send_error(record)
             return
 
@@ -391,7 +404,7 @@ class DiscordWebhookHandler(logging.Handler):
         fields: Sequence[tuple[str, str]] | None = None,
         record: LogRecord | None = None,
     ) -> None:
-        """Send a Discord embed message."""
+        """Sends a Discord embed message."""
         embed: dict[str, Any] = {"title": f"{socket.gethostname()[:100]} {suffix}!"}
         if description:
             embed["description"] = description
@@ -408,7 +421,11 @@ class DiscordWebhookHandler(logging.Handler):
         self._send(record, payload)
 
     def send_error(self, record: LogRecord) -> None:
-        """Send a record with an exception info."""
+        """Sends a record carrying exception info.
+
+        Raises:
+            ValueError: If record has no exception info.
+        """
         if not record.exc_info:
             raise ValueError(f"No error found in record: {record}")
 
@@ -427,7 +444,7 @@ class DiscordWebhookHandler(logging.Handler):
         elif isinstance(exc_val, (SystemExit, Exit)):
             code = exc_val.code if isinstance(exc_val.code, int) else 0
             if code == 0:
-                suffix = "succeed"
+                suffix = "succeeded"
                 color = DiscordColors.GREEN
             if code == SIGINT_EXIT_CODE:
                 suffix = "interrupted"
@@ -435,21 +452,21 @@ class DiscordWebhookHandler(logging.Handler):
             if isinstance(exc_val, Exit):
                 tb_text = exc_val.stderr
 
-        description = f"Command: {_cap_cmd()}\nWorking Directory: {_cap_cwd()}\nReturn Code: {code}"
+        description = f"Command: {cap_cmd()}\nWorking Directory: {cap_cwd()}\nReturn Code: {code}"
         if msg := record.getMessage():
             description += f"\nMessage: {msg[:500]}"
-        # limit length
+        # limit length.
         fields = [("Traceback", f"```python\n{tb_text[-1000:]}```")] if code and tb_text else None
 
         self.send_embed(suffix, description, color, fields, record)
 
     def send(self) -> None:
-        """Send the buffered messages."""
+        """Sends the buffered messages."""
         if self.buffer_message_len == 0:
-            # if buffer is empty, skip sending
+            # buffer is empty, skip sending.
             return
 
-        # prepare body of message
+        # prepare body of message.
         log_message = ""
         for b in self.buffer:
             for line in b[1]:
@@ -457,7 +474,7 @@ class DiscordWebhookHandler(logging.Handler):
 
         record = self.buffer[-1][0]
 
-        # prepare message for sending, exclude last \n char
+        # prepare message for sending, excluding the last \n char.
         payload = {
             "content": self.config.template.format(
                 hostname=socket.gethostname(), title=self.config.title, text=log_message[:-1]
@@ -467,9 +484,9 @@ class DiscordWebhookHandler(logging.Handler):
         self._send(record, payload)
 
     def _send(self, record: LogRecord, payload: dict[str, Any]) -> None:
-        """Send a payload."""
+        """Sends a payload, retrying on rate limits and recording failures on record."""
         r: requests.Response | None = None
-        # few lines of sending code from https://github.com/2press/discord-logger
+        # retry loop adapted from discord-logger, see README.md.
         for _ in range(MAX_RETRIES):
             with self._sema:
                 r = requests.post(self.webhook_url, json=payload, timeout=DISCORD_TIMEOUT)
@@ -479,22 +496,22 @@ class DiscordWebhookHandler(logging.Handler):
                 time.sleep(retry_after)
             elif r.status_code < http.HTTPStatus.BAD_REQUEST:
                 self.last_sent = datetime.now(tz=timezone.utc)
-                # clear on success
+                # clear on success.
                 self.buffer.clear()
                 self.buffer_message_len = 0
                 return
 
         try:
-            if r:
+            if r is not None:  # pragma: no branch
                 r.raise_for_status()
         except Exception:  # noqa: BLE001
             self.handleError(record)
-            # clear on failure
+            # clear on failure.
             self.buffer.clear()
             self.buffer_message_len = 0
 
 
-def wrap_program(
+def wrap_program(  # noqa: PLR0913, PLR0917
     webhook: str,
     program: str,
     args: list[str] | None,
@@ -504,8 +521,8 @@ def wrap_program(
     title: str | None,
     only_log: bool,
 ) -> None:
-    """Wrap a python script or other program in a Discord logging environment."""
-    # set up logger
+    """Wraps a Python script or other program in a Discord logging environment."""
+    # set up logger.
     logger = logging.getLogger("dissi")
     logger.setLevel(logging.INFO)
     config = DiscordWebhookConfig(title=title)
@@ -513,28 +530,27 @@ def wrap_program(
     handler = DiscordWebhookHandler(webhook_url=webhook, formatter=formatter)
     logger.addHandler(handler)
 
-    # set new args
+    # set new args.
     sys.argv = [program, *(args or [])]
 
-    # set up signal handling
-    _setup_signal_handling(handler)
+    # set up signal handling.
+    setup_signal_handling(handler)
 
-    # log the start of the program
+    # log the start of the program.
     handler.send_embed(
         "started",
-        f"Command: {_cap_cmd()}\nWorking Directory: {_cap_cwd()}",
+        f"Command: {cap_cmd()}\nWorking Directory: {cap_cwd()}",
         DiscordColors.LIGHT_BLUE,
     )
 
     code = 0
     stderr = ""
     try:
-        # if not forced, try to run in as python module first,
-        # if it fails, run it as normal executable.
+        # try to run as a Python module first, falling back to a normal executable if that fails.
         if grep:
-            code, stderr = _run_grep(grep, only_log, logger)
+            code, stderr = run_grep(grep, only_log, logger)
         elif force_exec:
-            code, stderr = _run_program()
+            code, stderr = run_program()
         else:
             run_as_py = True
             try:
@@ -548,11 +564,11 @@ def wrap_program(
                     raise
                 run_as_py = False
             if not run_as_py:
-                code, stderr = _run_program()
+                code, stderr = run_program()
 
     except BaseException:
-        # log any occuring error
+        # log any occurring error.
         logger.exception("")
         raise
-    # log successful exits or failed exits from normal executables
+    # log successful exits or failed exits from normal executables.
     logger.error("", exc_info=(Exit, Exit(code, stderr), None))

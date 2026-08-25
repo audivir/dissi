@@ -1,0 +1,5 @@
+This project is a port of DiscordWebhookLogging by matobodo,
+available at https://github.com/matobodo/DiscordWebhookLogging, licensed under the MIT License.
+
+Portions of the sending logic in dissi/main.py are adapted from discord-logger by 2press,
+available at https://github.com/2press/discord-logger, licensed under the MIT License.
